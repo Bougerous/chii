@@ -1,10 +1,84 @@
 import sqlite3
+import json
+import re
+from typing import List, Dict, Any, Tuple, Optional
 import tkinter as tk
 from tkinter import ttk, messagebox
-import re
 import datetime
-import json
 
+
+###############################################################################
+# RangeParser Class
+###############################################################################
+
+class RangeParser:
+    """Parses reference ranges from various textual formats into numeric low/high values and units."""
+
+    def __init__(self):
+        self.special_chars = {
+            '³': '',
+            '²': '',
+            '⁻': '-',
+            '⁺': '+',
+            '₂': '2',
+            '₃': '3'
+        }
+        self.unit_pattern = re.compile(r'[a-zA-Z/%]+.*$')
+        self.number_pattern = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+
+    def parse_range(self, range_str: str) -> Tuple[Optional[float], Optional[float], str]:
+        """Parse a given reference range string into (low, high, unit)."""
+        if not isinstance(range_str, str) or not range_str.strip():
+            return None, None, ''
+        
+        cleaned = self._clean_string(range_str)
+
+        # Handle special cases (<, >)
+        if '<' in cleaned:
+            return self._handle_less_than(cleaned)
+        if '>' in cleaned:
+            return self._handle_greater_than(cleaned)
+
+        numbers = self._extract_numbers(cleaned)
+        unit = self._extract_unit(cleaned)
+        return self._process_range(numbers, unit)
+
+    def _clean_string(self, value: str) -> str:
+        for char, replacement in self.special_chars.items():
+            value = value.replace(char, replacement)
+        # Normalize range separators
+        value = value.replace(',', '').replace('–', '-').replace(' to ', '-')
+        value = value.replace('−', '-').replace('—', '-')
+        return value.strip()
+
+    def _extract_numbers(self, value: str) -> list:
+        return [float(n) for n in self.number_pattern.findall(value)]
+
+    def _extract_unit(self, value: str) -> str:
+        match = self.unit_pattern.search(value)
+        return match.group().strip() if match else ''
+
+    def _process_range(self, numbers: list, unit: str) -> Tuple[Optional[float], Optional[float], str]:
+        if len(numbers) >= 2:
+            return numbers[0], numbers[1], unit
+        elif len(numbers) == 1:
+            return numbers[0], numbers[0], unit
+        return None, None, unit
+
+    def _handle_less_than(self, value: str) -> Tuple[Optional[float], Optional[float], str]:
+        numbers = self._extract_numbers(value)
+        unit = self._extract_unit(value)
+        return (None, numbers[0], unit) if numbers else (None, None, unit)
+
+    def _handle_greater_than(self, value: str) -> Tuple[Optional[float], Optional[float], str]:
+        numbers = self._extract_numbers(value)
+        unit = self._extract_unit(value)
+        return (numbers[0], None, unit) if numbers else (None, None, unit)
+
+
+###############################################################################
+# LabDatabase Class
+###############################################################################
 
 class LabDatabase:
     """Handles all SQLite database interactions for lab parameters."""
@@ -12,6 +86,7 @@ class LabDatabase:
     def __init__(self, db_name: str = "lab_parameters.db"):
         self.db_name = db_name
         self.conn = sqlite3.connect(db_name)
+        self.parser = RangeParser()
         self.create_tables()
 
     def create_tables(self):
@@ -21,6 +96,7 @@ class LabDatabase:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             parameter_name TEXT NOT NULL,
             category TEXT,
+            sub_category TEXT,
             age_group TEXT NOT NULL,
             low_range REAL NOT NULL,
             high_range REAL NOT NULL,
@@ -31,16 +107,16 @@ class LabDatabase:
         ''')
         self.conn.commit()
 
-    def add_parameter(self, parameter_name: str, category: str, age_group: str, 
-                      low_range: float, high_range: float, 
+    def add_parameter(self, parameter_name: str, category: str, sub_category: str, 
+                      age_group: str, low_range: float, high_range: float, 
                       unit: str = None, notes: str = None) -> bool:
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT INTO lab_parameters 
-                (parameter_name, category, age_group, low_range, high_range, unit, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (parameter_name, category, age_group, low_range, high_range, unit, notes))
+                (parameter_name, category, sub_category, age_group, low_range, high_range, unit, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (parameter_name, category, sub_category, age_group, low_range, high_range, unit, notes))
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -66,7 +142,7 @@ class LabDatabase:
         return cursor.fetchall()
 
     def update_parameter(self, old_param_name: str, old_age_group: str,
-                         new_param_name: str, new_category: str, new_age_group: str,
+                         new_param_name: str, new_category: str, new_sub_category: str, new_age_group: str,
                          low_range: float, high_range: float,
                          unit: str = None, notes: str = None) -> bool:
         try:
@@ -83,9 +159,10 @@ class LabDatabase:
 
             cursor.execute('''
             UPDATE lab_parameters 
-            SET parameter_name=?, category=?, age_group=?, low_range=?, high_range=?, unit=?, notes=?
+            SET parameter_name=?, category=?, sub_category=?, age_group=?, low_range=?, high_range=?, unit=?, notes=?
             WHERE parameter_name=? AND age_group=?
-            ''', (new_param_name, new_category, new_age_group, low_range, high_range, unit, notes, old_param_name, old_age_group))
+            ''', (new_param_name, new_category, new_sub_category, new_age_group, low_range, high_range, unit, notes,
+                  old_param_name, old_age_group))
             self.conn.commit()
             return cursor.rowcount > 0
         except sqlite3.Error:
@@ -107,10 +184,57 @@ class LabDatabase:
     def __del__(self):
         self.close()
 
+    def get_unique_units(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT DISTINCT unit FROM lab_parameters WHERE unit IS NOT NULL')
+        return [row[0] for row in cursor.fetchall()]
+
+    def add_parameters_from_json(self, json_data: Dict[str, Any]) -> None:
+        """Parses a JSON structure and inserts the parameters into the DB."""
+        cursor = self.conn.cursor()
+        for category, tests in json_data.get("NICU_Tests", {}).items():
+            # If tests is a dict of subcategories:
+            if isinstance(tests, dict) and any(isinstance(v, list) for v in tests.values()):
+                # AdvancedTests like structure: category -> subcategory -> tests[]
+                for sub_cat, sub_tests in tests.items():
+                    for test in sub_tests:
+                        self._process_and_insert_test(cursor, test, category, sub_cat)
+            else:
+                # Normal: category -> tests[]
+                for test in tests:
+                    self._process_and_insert_test(cursor, test, category, None)
+        self.conn.commit()
+
+    def _process_and_insert_test(self, cursor, test, category, sub_category):
+        try:
+            parameter_name = test["Test"]
+            reference_range = test["ReferenceRange"]
+
+            if isinstance(reference_range, dict):
+                for age_group, range_value in reference_range.items():
+                    low, high, unit = self.parser.parse_range(str(range_value))
+                    if low is not None and high is not None:
+                        self._insert_parameter(cursor, parameter_name, category, sub_category, age_group, low, high, unit)
+            else:
+                low, high, unit = self.parser.parse_range(str(reference_range))
+                if low is not None and high is not None:
+                    self._insert_parameter(cursor, parameter_name, category, sub_category, "All", low, high, unit)
+        except Exception as e:
+            print(f"Error processing {test.get('Test', 'Unknown')}: {str(e)}")
+
+    def _insert_parameter(self, cursor, name, category, sub_category, age_group, low, high, unit):
+        cursor.execute('''
+            INSERT OR IGNORE INTO lab_parameters 
+            (parameter_name, category, sub_category, age_group, low_range, high_range, unit, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, sub_category, age_group, low, high, unit, ''))
+
+
+###############################################################################
+# EditParameterDialog Class
+###############################################################################
 
 class EditParameterDialog(tk.Toplevel):
-    """A dialog window for editing a single lab parameter."""
-
     def __init__(self, parent, values, age_groups, units):
         super().__init__(parent.root)
         self.title("Edit Parameter")
@@ -119,9 +243,7 @@ class EditParameterDialog(tk.Toplevel):
 
         # values = (Parameter, Category, Age Group, Range, Unit, Notes)
         param_name, category, age_group, param_range, unit, notes = values
-        low_val, high_val = param_range.split("-")
-        low_val = low_val.strip()
-        high_val = high_val.strip()
+        low_val, high_val = [v.strip() for v in param_range.split("-")]
 
         tk.Label(self, text="Parameter Name:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
         self.param_name_entry = ttk.Entry(self)
@@ -133,35 +255,40 @@ class EditParameterDialog(tk.Toplevel):
         self.category_entry.insert(0, category)
         self.category_entry.grid(row=1, column=1, padx=5, pady=5)
 
-        tk.Label(self, text="Age Group:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self, text="Sub-Category:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.sub_category_entry = ttk.Entry(self)
+        self.sub_category_entry.insert(0, "")
+        self.sub_category_entry.grid(row=2, column=1, padx=5, pady=5)
+
+        tk.Label(self, text="Age Group:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
         self.age_group_combo = ttk.Combobox(self, values=age_groups, state="readonly")
         self.age_group_combo.set(age_group)
-        self.age_group_combo.grid(row=2, column=1, padx=5, pady=5)
+        self.age_group_combo.grid(row=3, column=1, padx=5, pady=5)
 
-        tk.Label(self, text="Lower Range:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self, text="Lower Range:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
         self.low_range_entry = ttk.Entry(self)
         self.low_range_entry.insert(0, low_val)
-        self.low_range_entry.grid(row=3, column=1, padx=5, pady=5)
+        self.low_range_entry.grid(row=4, column=1, padx=5, pady=5)
 
-        tk.Label(self, text="Higher Range:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self, text="Higher Range:").grid(row=5, column=0, padx=5, pady=5, sticky="e")
         self.high_range_entry = ttk.Entry(self)
         self.high_range_entry.insert(0, high_val)
-        self.high_range_entry.grid(row=4, column=1, padx=5, pady=5)
+        self.high_range_entry.grid(row=5, column=1, padx=5, pady=5)
 
-        tk.Label(self, text="Unit:").grid(row=5, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self, text="Unit:").grid(row=6, column=0, padx=5, pady=5, sticky="e")
         self.unit_combo = ttk.Combobox(self, values=units, state="readonly")
         if unit:
             self.unit_combo.set(unit)
-        self.unit_combo.grid(row=5, column=1, padx=5, pady=5)
+        self.unit_combo.grid(row=6, column=1, padx=5, pady=5)
 
-        tk.Label(self, text="Notes:").grid(row=6, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self, text="Notes:").grid(row=7, column=0, padx=5, pady=5, sticky="e")
         self.notes_entry = ttk.Entry(self)
         if notes:
             self.notes_entry.insert(0, notes)
-        self.notes_entry.grid(row=6, column=1, padx=5, pady=5)
+        self.notes_entry.grid(row=7, column=1, padx=5, pady=5)
 
         button_frame = tk.Frame(self)
-        button_frame.grid(row=7, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=8, column=0, columnspan=2, pady=10)
 
         ok_button = ttk.Button(button_frame, text="OK", command=self.on_ok)
         ok_button.grid(row=0, column=0, padx=5)
@@ -171,7 +298,8 @@ class EditParameterDialog(tk.Toplevel):
 
     def on_ok(self):
         param_name = self.param_name_entry.get().strip()
-        category = self.category_entry.get().strip()
+        category = self.category_entry.get().strip() if self.category_entry.get().strip() else None
+        sub_category = self.sub_category_entry.get().strip() if self.sub_category_entry.get().strip() else None
         age_group = self.age_group_combo.get().strip()
         low_val = self.low_range_entry.get().strip()
         high_val = self.high_range_entry.get().strip()
@@ -194,7 +322,7 @@ class EditParameterDialog(tk.Toplevel):
             messagebox.showerror("Error", "Lower range must be less than higher range.", parent=self)
             return
 
-        self.result = (param_name, category, age_group, low, high, unit, notes)
+        self.result = (param_name, category, sub_category, age_group, low, high, unit, notes)
         self.destroy()
 
     def on_cancel(self):
@@ -202,16 +330,21 @@ class EditParameterDialog(tk.Toplevel):
         self.destroy()
 
 
-class LabParametersGUI:
-    """Main application GUI for managing lab parameters."""
+###############################################################################
+# LabParametersGUI Class
+###############################################################################
 
+class LabParametersGUI:
     AGE_GROUPS = [
         "Neonate",
         "Infant",
         "Child",
         "Adolescent",
         "Adult",
-        "Pregnancy"
+        "Pregnancy",
+        "Term",
+        "Preterm",
+        "All"
     ]
 
     UNITS = [
@@ -226,15 +359,51 @@ class LabParametersGUI:
         "ratio",
         "seconds",
         "K/µL",
-        "mm/hr"
+        "mm/hr",
+        "mm³",
+        "mmHg",
+        "µIU/mL",
+        "ng/dL",
+        "pg/mL",
+        "cells/mm³",
+        "mg/L",
+        "/mm³",
+        "pg/dL"
     ]
+
+    # Static categories based on provided database categories
+    CATEGORIES = [
+        "Hematology",
+        "BloodGas",
+        "Electrolytes",
+        "LiverFunctionTests",
+        "RenalFunctionTests",
+        "InfectionMarkers",
+        "Coagulation",
+        "Other"
+    ]
+
+    # Static subcategories (no subcategories used, just empty)
+    SUBCATEGORIES = {
+        "Hematology": [],
+        "BloodGas": [],
+        "Electrolytes": [],
+        "LiverFunctionTests": [],
+        "RenalFunctionTests": [],
+        "InfectionMarkers": [],
+        "Coagulation": [],
+        "Other": []
+    }
 
     def __init__(self, root):
         self.root = root
+        self.db = LabDatabase()
         self.root.title("Lab Parameters Database")
         self.root.geometry("1000x700")
 
-        self.db = LabDatabase()
+        # Apply a theme for better aesthetics
+        style = ttk.Style()
+        style.theme_use("clam")
 
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
@@ -257,6 +426,16 @@ class LabParametersGUI:
         self.setup_view_tab()
         self.setup_parse_tab()
 
+        # Set static categories and subcategories
+        self.category['values'] = self.CATEGORIES
+        self.category.set("")
+        self.sub_category['values'] = []
+        self.sub_category.set("")
+
+        units_from_db = self.db.get_unique_units()
+        all_units = sorted(list(set(self.UNITS + units_from_db)))
+        self.unit['values'] = all_units
+
     def setup_add_tab(self):
         for i in range(7):
             self.add_tab.grid_columnconfigure(1, weight=1)
@@ -266,30 +445,34 @@ class LabParametersGUI:
         self.param_name.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
         ttk.Label(self.add_tab, text="Category:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.category = ttk.Entry(self.add_tab)
+        self.category = ttk.Combobox(self.add_tab, state="readonly")
         self.category.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(self.add_tab, text="Age Group:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(self.add_tab, text="Sub-Category:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.sub_category = ttk.Combobox(self.add_tab, state="readonly")
+        self.sub_category.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(self.add_tab, text="Age Group:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
         self.age_group = ttk.Combobox(self.add_tab, values=self.AGE_GROUPS, state="readonly")
-        self.age_group.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        self.age_group.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(self.add_tab, text="Lower Range:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(self.add_tab, text="Lower Range:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
         self.low_range = ttk.Entry(self.add_tab)
-        self.low_range.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+        self.low_range.grid(row=4, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(self.add_tab, text="Higher Range:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(self.add_tab, text="Higher Range:").grid(row=5, column=0, padx=5, pady=5, sticky="e")
         self.high_range = ttk.Entry(self.add_tab)
-        self.high_range.grid(row=4, column=1, padx=5, pady=5, sticky="ew")
+        self.high_range.grid(row=5, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(self.add_tab, text="Unit:").grid(row=5, column=0, padx=5, pady=5, sticky="e")
-        self.unit = ttk.Combobox(self.add_tab, values=self.UNITS, state="readonly")
-        self.unit.grid(row=5, column=1, padx=5, pady=5, sticky="ew")
+        ttk.Label(self.add_tab, text="Unit:").grid(row=6, column=0, padx=5, pady=5, sticky="e")
+        self.unit = ttk.Combobox(self.add_tab, state="readonly")
+        self.unit.grid(row=6, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(self.add_tab, text="Notes:").grid(row=6, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(self.add_tab, text="Notes:").grid(row=7, column=0, padx=5, pady=5, sticky="e")
         self.notes = ttk.Entry(self.add_tab)
-        self.notes.grid(row=6, column=1, padx=5, pady=5, sticky="ew")
+        self.notes.grid(row=7, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Button(self.add_tab, text="Add Parameter", command=self.add_parameter).grid(row=7, column=0, columnspan=2, pady=20)
+        ttk.Button(self.add_tab, text="Add Parameter", command=self.add_parameter).grid(row=8, column=0, columnspan=2, pady=20)
 
     def setup_search_tab(self):
         self.search_tab.grid_columnconfigure(1, weight=1)
@@ -363,7 +546,6 @@ class LabParametersGUI:
         ttk.Button(btn_frame, text="Parse", command=self.parse_text_input).grid(row=0, column=0, padx=5)
         ttk.Button(btn_frame, text="Clear All", command=lambda: self.raw_text.delete("1.0", tk.END)).grid(row=0, column=1, padx=5)
 
-        # The parsed_tree will show parsed results
         self.parsed_tree = ttk.Treeview(self.parse_tab, columns=("Parameter", "Age Group", "Range", "Unit", "Notes"), show="headings")
         self.setup_treeview(self.parsed_tree)
         self.parsed_tree.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
@@ -383,6 +565,7 @@ class LabParametersGUI:
     def add_parameter(self):
         param_name = self.param_name.get().strip()
         category = self.category.get().strip() if self.category.get().strip() else None
+        sub_category = self.sub_category.get().strip() if self.sub_category.get().strip() else None
         age_grp = self.age_group.get().strip()
         low_val = self.low_range.get().strip()
         high_val = self.high_range.get().strip()
@@ -392,6 +575,9 @@ class LabParametersGUI:
             return
         if not age_grp:
             messagebox.showerror("Error", "Age Group cannot be empty.")
+            return
+        if not category:
+            messagebox.showerror("Error", "Category cannot be empty.")
             return
 
         try:
@@ -408,6 +594,7 @@ class LabParametersGUI:
         success = self.db.add_parameter(
             param_name,
             category,
+            sub_category,
             age_grp,
             low,
             high,
@@ -417,8 +604,10 @@ class LabParametersGUI:
 
         if success:
             messagebox.showinfo("Success", "Parameter added successfully!")
-            for field in [self.param_name, self.category, self.low_range, self.high_range, self.notes]:
+            for field in [self.param_name, self.low_range, self.high_range, self.notes]:
                 field.delete(0, tk.END)
+            self.category.set("")
+            self.sub_category.set("")
             self.age_group.set("")
             self.unit.set("")
         else:
@@ -438,12 +627,12 @@ class LabParametersGUI:
         results = self.db.get_parameter(param_name, age_grp)
         for result in results:
             self.search_tree.insert("", "end", values=(
-                result[1],  
-                result[2] if result[2] else "", 
-                result[3],  
-                f"{result[4]} - {result[5]}",  
-                result[6] if result[6] else "", 
-                result[7] if result[7] else ""
+                result[1],
+                result[2] if result[2] else "",
+                result[4],
+                f"{result[5]} - {result[6]}",
+                result[7] if result[7] else "",
+                result[8] if result[8] else ""
             ))
 
     def refresh_view(self):
@@ -453,12 +642,12 @@ class LabParametersGUI:
         results = self.db.list_all_parameters()
         for result in results:
             self.view_tree.insert("", "end", values=(
-                result[1],
-                result[2] if result[2] else "",
-                result[3],
-                f"{result[4]} - {result[5]}",
-                result[6] if result[6] else "",
-                result[7] if result[7] else ""
+                result[1],  # Parameter
+                result[2] if result[2] else "",  # Category
+                result[4],  # Age Group
+                f"{result[5]} - {result[6]}",  # Range
+                result[7] if result[7] else "", # Unit
+                result[8] if result[8] else ""  # Notes
             ))
 
     def edit_selected(self, tree):
@@ -473,12 +662,19 @@ class LabParametersGUI:
             dialog = EditParameterDialog(self, values, self.AGE_GROUPS, self.UNITS)
             self.root.wait_window(dialog)
             if dialog.result:
+                (param_name, category, sub_category, age_group, low, high, unit, notes) = dialog.result
                 old_param_name = values[0]
                 old_age_group = values[2]
-                param_name, category, age_group, range_min, range_max, unit, notes = dialog.result
-                updated = self.db.update_parameter(old_param_name, old_age_group, param_name, category, age_group, range_min, range_max, unit, notes)
+                updated = self.db.update_parameter(old_param_name, old_age_group, param_name, category, sub_category, age_group, low, high, unit, notes)
                 if updated:
-                    tree.item(selected_item, values=(param_name, category if category else "", age_group, f"{range_min} - {range_max}", unit if unit else "", notes if notes else ""))
+                    tree.item(selected_item, values=(
+                        param_name,
+                        category if category else "",
+                        age_group,
+                        f"{low} - {high}",
+                        unit if unit else "",
+                        notes if notes else ""
+                    ))
                     messagebox.showinfo("Success", "Parameter updated successfully!")
                     if tree == self.search_tree:
                         self.search_parameters()
@@ -526,15 +722,16 @@ class LabParametersGUI:
                 return
 
             for entry in parsed_entries:
-                param_name, category, age_group, low, high, unit, _ = entry
+                # entry: (test_name, category, sub_category, age_group, low, high, unit, '')
+                test_name, category, sub_category, age_group, low, high, unit, notes = entry
                 range_str = f"{low} - {high}"
-                notes = f"Category: {category}" if category else ""
+                notes_str = notes if notes else (f"Category: {category}" if category else "")
                 self.parsed_tree.insert("", "end", values=(
-                    param_name,
+                    test_name,
                     age_group,
                     range_str,
                     unit if unit else "",
-                    notes
+                    notes_str
                 ))
 
         except json.JSONDecodeError as e:
@@ -575,6 +772,7 @@ class LabParametersGUI:
             success = self.db.add_parameter(
                 param_name,
                 None,
+                None,
                 age,
                 low,
                 high,
@@ -597,112 +795,46 @@ class LabParametersGUI:
             messagebox.showinfo("Import Summary", summary)
 
     def parse_nicu_reference_ranges(self, json_data):
-        """Parses NICU reference ranges from JSON input."""
-        try:
-            # Parse JSON string if it's a string, otherwise use the data directly
-            if isinstance(json_data, str):
-                data = json.loads(json_data)
-            else:
-                data = json_data
+        if isinstance(json_data, str):
+            data = json.loads(json_data)
+        else:
+            data = json_data
 
-            print("Successfully parsed JSON")  # Debug print
-            results = []
-            
-            def extract_range_and_unit(range_str):
-                """Extract numeric range and unit from a range string."""
-                print(f"Processing range string: {range_str}")  # Debug print
-                
-                # Remove commas from numbers
-                range_str = range_str.replace(',', '')
-                
-                # Handle special cases
-                if '>' in range_str:
-                    parts = range_str.replace('>', '').strip().split()
-                    num = float(''.join(filter(lambda x: x.isdigit() or x == '.', parts[0])))
-                    unit = ' '.join(parts[1:]) if len(parts) > 1 else '%' if '%' in parts[0] else ''
-                    print(f"Extracted '>' range: {num} to inf, unit: {unit}")  # Debug print
-                    return num, float('inf'), unit
-                elif '<' in range_str:
-                    parts = range_str.replace('<', '').strip().split()
-                    num = float(''.join(filter(lambda x: x.isdigit() or x == '.', parts[0])))
-                    unit = ' '.join(parts[1:]) if len(parts) > 1 else '%' if '%' in parts[0] else ''
-                    print(f"Extracted '<' range: 0 to {num}, unit: {unit}")  # Debug print
-                    return 0, num, unit
-                
-                # Handle ranges with '-' or 'to'
-                range_str = range_str.replace('–', '-').replace(' to ', '-')
-                
-                # Split into numeric part and unit part
-                parts = range_str.split()
-                numeric_part = parts[0]
-                unit_part = ' '.join(parts[1:]) if len(parts) > 1 else ''
-                
-                # If the numeric part ends with %, handle it specially
-                if '%' in numeric_part:
-                    unit_part = '%'
-                    numeric_part = numeric_part.replace('%', '')
-                
-                # Extract numbers
-                range_nums = numeric_part.split('-')
-                try:
-                    if len(range_nums) == 2:
-                        low = float(''.join(filter(lambda x: x.isdigit() or x == '.', range_nums[0])))
-                        high = float(''.join(filter(lambda x: x.isdigit() or x == '.', range_nums[1])))
-                        print(f"Extracted range: {low} to {high}, unit: {unit_part}")  # Debug print
-                        return low, high, unit_part if unit_part else '%' if '%' in range_str else ''
-                    else:
-                        num = float(''.join(filter(lambda x: x.isdigit() or x == '.', range_nums[0])))
-                        print(f"Extracted single value: {num}, unit: {unit_part}")  # Debug print
-                        return num, num, unit_part if unit_part else '%' if '%' in range_str else ''
-                except ValueError as e:
-                    print(f"Error extracting numbers: {e}")  # Debug print
-                    return None, None, ''
+        if not isinstance(data, dict) or 'NICU_Tests' not in data:
+            raise ValueError("Invalid JSON structure: Expected 'NICU_Tests' as top-level key")
 
-            def process_test(test_data, category):
-                """Process a single test entry."""
-                print(f"\nProcessing test: {test_data['Test']} in category: {category}")  # Debug print
-                test_name = test_data['Test']
-                ref_range = test_data['ReferenceRange']
-                
-                if isinstance(ref_range, dict):
-                    print(f"Found multiple ranges for different age groups")  # Debug print
-                    # Handle different ranges for Term/Preterm
-                    for age_group, range_str in ref_range.items():
-                        print(f"Processing age group: {age_group}")  # Debug print
-                        low, high, unit = extract_range_and_unit(range_str)
-                        if low is not None and high is not None:
-                            results.append((test_name, category, age_group, low, high, unit, ''))
-                            print(f"Added result for {age_group}")  # Debug print
-                else:
-                    print("Processing single range")  # Debug print
-                    # Single range for all age groups
-                    low, high, unit = extract_range_and_unit(ref_range)
+        results = []
+        parser = self.db.parser
+
+        def process_test(test_data, category, sub_category=None):
+            if not isinstance(test_data, dict) or 'Test' not in test_data or 'ReferenceRange' not in test_data:
+                return
+
+            test_name = test_data['Test']
+            ref_range = test_data['ReferenceRange']
+
+            if isinstance(ref_range, dict):
+                for age_group, range_str in ref_range.items():
+                    low, high, unit = parser.parse_range(str(range_str))
                     if low is not None and high is not None:
-                        results.append((test_name, category, 'Neonate', low, high, unit, ''))
-                        print("Added result for Neonate")  # Debug print
+                        results.append((test_name, category, sub_category, age_group, low, high, unit, ''))
+            else:
+                low, high, unit = parser.parse_range(str(ref_range))
+                if low is not None and high is not None:
+                    # Default to 'All' if no age group specified
+                    results.append((test_name, category, sub_category, 'All', low, high, unit, ''))
 
-            # Process main categories
-            for category, tests in data['NICU_Tests'].items():
-                print(f"\nProcessing category: {category}")  # Debug print
-                if category != 'AdvancedTests':
-                    for test in tests:
-                        process_test(test, category)
-                else:
-                    # Handle advanced tests subcategories
-                    for subcategory, subtests in tests.items():
-                        print(f"Processing subcategory: {subcategory}")  # Debug print
-                        for test in subtests:
-                            process_test(test, f"{category}/{subcategory}")
+        for category, tests in data['NICU_Tests'].items():
+            # If this is a nested category structure:
+            if isinstance(tests, dict) and any(isinstance(v, list) for v in tests.values()):
+                for sub_cat, sub_tests in tests.items():
+                    for test in sub_tests:
+                        process_test(test, category, sub_cat)
+            else:
+                for test in tests:
+                    process_test(test, category, None)
 
-            print(f"\nTotal results found: {len(results)}")  # Debug print
-            return results
-
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON: {e}")
-            return []
-        except Exception as e:
-            print(f"Error processing data: {e}")
-            return []
+        return results
 
     def select_all_items(self, tree):
         tree.selection_remove(tree.selection())
@@ -721,10 +853,11 @@ class LabParametersGUI:
                     f"ID: {row[0]}\n"
                     f"Parameter: {row[1]}\n"
                     f"Category: {row[2]}\n"
-                    f"Age Group: {row[3]}\n"
-                    f"Range: {row[4]} - {row[5]}\n"
-                    f"Unit: {row[6]}\n"
-                    f"Notes: {row[7]}\n"
+                    f"Sub-Category: {row[3]}\n"
+                    f"Age Group: {row[4]}\n"
+                    f"Range: {row[5]} - {row[6]}\n"
+                    f"Unit: {row[7]}\n"
+                    f"Notes: {row[8]}\n"
                     + "-" * 50 + "\n"
                 )
 
@@ -754,6 +887,10 @@ class LabParametersGUI:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to purge database: {str(e)}")
 
+
+###############################################################################
+# Main Function
+###############################################################################
 
 def main():
     root = tk.Tk()
